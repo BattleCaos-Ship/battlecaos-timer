@@ -2,10 +2,13 @@ import 'dotenv/config';
 import { createRedis } from './redis.js';
 import { producer, createConsumer } from './kafka.js';
 import { log } from './logger.js';
+import { startObservability, conCorrelation, correlationActual, instrumentar, trackConsumer } from './observability.js';
 import { startTimer, stopTimer, pauseTimer, resumeTimer, hasActiveTimer } from './TimerManager.js';
 
 export const redis = createRedis();
 await redis.connect();
+
+startObservability({ port: process.env.OBS_PORT ?? 9100, redis });
 
 await producer.connect();
 log.info('kafka producer conectado');
@@ -39,7 +42,7 @@ async function publishTick(codigo, tipo, remaining) {
   await producer.send({
     topic: 'evt.timer',
     messages: [{ key: codigo, value: JSON.stringify({
-      type: 'TimerTick', source: 'timer', timestamp: Date.now(),
+      type: 'TimerTick', source: 'timer', timestamp: Date.now(), version: 1, correlationId: correlationActual(),
       data: { codigo, tipo, remaining },
     }) }],
   });
@@ -49,7 +52,7 @@ async function publishEnd(codigo, tipo) {
   await producer.send({
     topic: 'evt.timer',
     messages: [{ key: codigo, value: JSON.stringify({
-      type: 'TimerEnd', source: 'timer', timestamp: Date.now(),
+      type: 'TimerEnd', source: 'timer', timestamp: Date.now(), version: 1, correlationId: correlationActual(),
       data: { codigo, tipo },
     }) }],
   });
@@ -115,12 +118,14 @@ function handleMessage(msg) {
 const TOPICS = ['evt.room', 'evt.game'];
 
 async function dispatch({ message }) {
-  try {
-    const msg = JSON.parse(message.value.toString());
-    handleMessage(msg);
-  } catch (err) {
-    log.error('error procesando mensaje —', err.message);
-  }
+  const msg = JSON.parse(message.value.toString());
+  await conCorrelation(msg.correlationId, async () => {
+    try {
+      await instrumentar(msg.type ?? 'evt', async () => handleMessage(msg))();
+    } catch (err) {
+      log.error(`error procesando mensaje — ${err.message} [cid=${correlationActual()}]`);
+    }
+  });
 }
 
 async function startConsumer() {
@@ -129,6 +134,7 @@ async function startConsumer() {
   // ser la que tiene el lease de líder en Redis, perdiendo el evento en silencio. Cada réplica
   // debe ver el stream completo; isLeader (arriba) decide cuál de ellas actúa.
   const consumer = createConsumer(`timer-${ME}`);
+  trackConsumer(consumer); // salud del consumer -> kafka_consumer_up + /health
   await consumer.connect();
   await consumer.subscribe({ topics: TOPICS, fromBeginning: false });
 
